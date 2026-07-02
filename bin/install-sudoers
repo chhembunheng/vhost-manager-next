@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -n "${VHOST_MANAGER_CONFIG:-}" ]]; then
+    CONFIG_FILE="${VHOST_MANAGER_CONFIG}"
+elif [[ -f "${APP_DIR}/config/app.env.local" ]]; then
+    CONFIG_FILE="${APP_DIR}/config/app.env.local"
+else
+    CONFIG_FILE="${APP_DIR}/config/app.env"
+fi
+
+load_config() {
+    [[ -f "${CONFIG_FILE}" ]] || return
+
+    local key value
+    while IFS='=' read -r key value || [[ -n "${key}" ]]; do
+        [[ "${key}" =~ ^VHOST_[A-Z0-9_]+$ ]] || continue
+        value="${value%$'\r'}"
+
+        case "${key}" in
+            VHOST_APP_USERS)
+                printf -v "${key}" '%s' "${value}"
+                ;;
+        esac
+    done < "${CONFIG_FILE}"
+}
+
+load_config
+
+APP_USERS="${VHOST_APP_USERS:-${SUDO_USER:-${USER:-www-data}}}"
+SUDOERS_FILE="/etc/sudoers.d/vhost-manager-next"
+TMP_FILE="$(mktemp)"
+
+cleanup() {
+    rm -f "${TMP_FILE}"
+}
+trap cleanup EXIT
+
+IFS=',' read -ra users <<< "${APP_USERS}"
+for user in "${users[@]}"; do
+    user="${user//[[:space:]]/}"
+    [[ -n "${user}" ]] && printf "%s ALL=(root) NOPASSWD: %s/bin/vhostctl\n" "${user}" "${APP_DIR}" >> "${TMP_FILE}"
+done
+
+[[ -s "${TMP_FILE}" ]] || {
+    echo "No sudoers users configured." >&2
+    exit 1
+}
+
+if [[ "${EUID}" -ne 0 ]]; then
+    echo "Run with sudo: sudo ${APP_DIR}/bin/install-sudoers" >&2
+    exit 1
+fi
+
+install -o root -g root -m 440 "${TMP_FILE}" "${SUDOERS_FILE}"
+visudo -cf "${SUDOERS_FILE}"
+chmod 755 "${APP_DIR}/bin/vhostctl"
+
+echo "Installed sudoers: ${SUDOERS_FILE}"

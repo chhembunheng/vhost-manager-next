@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -n "${VHOST_MANAGER_CONFIG:-}" ]]; then
+    CONFIG_FILE="${VHOST_MANAGER_CONFIG}"
+elif [[ -f "${APP_DIR}/config/app.env.local" ]]; then
+    CONFIG_FILE="${APP_DIR}/config/app.env.local"
+else
+    CONFIG_FILE="${APP_DIR}/config/app.env"
+fi
+
+load_config() {
+    [[ -f "${CONFIG_FILE}" ]] || return
+
+    local key value
+    while IFS='=' read -r key value || [[ -n "${key}" ]]; do
+        [[ "${key}" =~ ^VHOST_[A-Z0-9_]+$ ]] || continue
+        value="${value%$'\r'}"
+
+        case "${key}" in
+            VHOST_OWNER|VHOST_GROUP|VHOST_BASE_DIR|VHOST_ALLOWED_BASE_DIRS|VHOST_HOST_IP|VHOST_NGINX_SITES_AVAILABLE|VHOST_NGINX_SITES_ENABLED|VHOST_ALLOWED_PHP_VERSIONS)
+                printf -v "${key}" '%s' "${value}"
+                ;;
+        esac
+    done < "${CONFIG_FILE}"
+}
+
+load_config
+
+CURRENT_USER="${VHOST_OWNER:-${SUDO_USER:-${USER:-www-data}}}"
+CURRENT_GROUP="${VHOST_GROUP:-www-data}"
+BASE_DIR="${VHOST_BASE_DIR:-/home/${CURRENT_USER}/www}"
+ALLOWED_BASE_DIRS="${VHOST_ALLOWED_BASE_DIRS:-${BASE_DIR}}"
+IP="${VHOST_HOST_IP:-127.0.0.1}"
+NGINX_SITES_AVAILABLE="${VHOST_NGINX_SITES_AVAILABLE:-/etc/nginx/sites-available}"
+NGINX_SITES_ENABLED="${VHOST_NGINX_SITES_ENABLED:-/etc/nginx/sites-enabled}"
+ALLOWED_PHP_VERSIONS="${VHOST_ALLOWED_PHP_VERSIONS:-8.5,8.3,8.2,8.1,8.0,7.4,5.6}"
+
+usage() {
+    echo "Usage:"
+    echo "  vhostctl create --domain DOMAIN --root PROJECT_PATH (--php PHP_VERSION | --no-php) [--base-dir BASE_DIR] [--install-php]"
+    echo "  vhostctl delete --domain DOMAIN --confirm DOMAIN"
+}
+
+fail() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+require_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        fail "This helper must run as root."
+    fi
+}
+
+validate_domain() {
+    local domain="$1"
+    [[ "${domain}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]] \
+        || fail "Invalid domain. Use a normal hostname like app.local or example.com.kh."
+}
+
+normalize_path() {
+    readlink -m "$1"
+}
+
+validate_base_dir() {
+    local base
+    base="$(normalize_path "$1")"
+
+    [[ "${base}" = /* ]] || fail "Project root must be an absolute path."
+    [[ -d "${base}" ]] || fail "Project root does not exist: ${base}"
+
+    local allowed allowed_norm
+    IFS=',' read -ra allowed_items <<< "${ALLOWED_BASE_DIRS}"
+    for allowed in "${allowed_items[@]}"; do
+        allowed="${allowed//[[:space:]]/}"
+        [[ -n "${allowed}" ]] || continue
+        allowed_norm="$(normalize_path "${allowed}")"
+
+        if [[ "${base}" == "${allowed_norm}" || "${base}" == "${allowed_norm}/"* ]]; then
+            BASE_DIR="${base}"
+            return
+        fi
+    done
+
+    fail "Project root is not allowed: ${base}"
+}
+
+validate_project_root() {
+    local root="$1"
+    [[ -n "${root}" ]] || fail "Project path is required."
+    [[ "${BASE_DIR}" = /* ]] || fail "VHOST_BASE_DIR must be an absolute path."
+    [[ "${root}" != /* ]] || fail "Project path must be relative to ${BASE_DIR}."
+    [[ "${root}" != *".."* ]] || fail "Project path cannot contain '..'."
+    [[ "${root}" =~ ^[A-Za-z0-9._/-]+$ ]] || fail "Project path contains unsupported characters."
+}
+
+validate_php_version() {
+    local version="$1"
+    [[ ",${ALLOWED_PHP_VERSIONS}," == *",${version},"* ]] || fail "Unsupported PHP version: ${version}"
+}
+
+php_fpm_ready() {
+    local version="$1"
+    local sock="/run/php/php${version}-fpm.sock"
+    [[ -S "${sock}" ]]
+}
+
+install_php_version() {
+    local version="$1"
+    local packages=(
+        "php${version}-fpm"
+        "php${version}-common"
+        "php${version}-mysql"
+        "php${version}-xml"
+        "php${version}-xmlrpc"
+        "php${version}-curl"
+        "php${version}-gd"
+        "php${version}-imagick"
+        "php${version}-cli"
+        "php${version}-dev"
+        "php${version}-imap"
+        "php${version}-mbstring"
+        "php${version}-soap"
+        "php${version}-zip"
+        "php${version}-bcmath"
+        "php${version}-intl"
+        "php${version}-xdebug"
+        "php${version}-redis"
+        "php${version}-pgsql"
+    )
+
+    if [[ "${version}" == "5.6" || "${version}" == "7.4" ]]; then
+        packages+=("php${version}-mcrypt")
+    fi
+
+    command -v apt-get >/dev/null 2>&1 || fail "apt-get is required to install PHP packages."
+
+    if ! command -v add-apt-repository >/dev/null 2>&1; then
+        echo "Installing software-properties-common..."
+        apt-get update
+        apt-get install -y software-properties-common
+    fi
+
+    if ! apt-cache policy "php${version}-fpm" | grep -q 'Candidate: [^(]'; then
+        echo "Adding ondrej/php repository..."
+        add-apt-repository ppa:ondrej/php -y
+        apt-get update
+    fi
+
+    echo "Installing PHP ${version} FPM and common extensions..."
+    apt-get install -y "${packages[@]}"
+    systemctl enable "php${version}-fpm"
+    systemctl start "php${version}-fpm"
+}
+
+ensure_php_fpm() {
+    local version="$1"
+    local install_missing="$2"
+
+    if php_fpm_ready "${version}"; then
+        return
+    fi
+
+    if systemctl list-unit-files "php${version}-fpm.service" >/dev/null 2>&1; then
+        systemctl start "php${version}-fpm" || true
+    fi
+
+    if php_fpm_ready "${version}"; then
+        return
+    fi
+
+    [[ "${install_missing}" == "1" ]] || fail "PHP-FPM socket not found: /run/php/php${version}-fpm.sock"
+
+    install_php_version "${version}"
+    php_fpm_ready "${version}" || fail "PHP-FPM socket still missing after install: /run/php/php${version}-fpm.sock"
+}
+
+create_site() {
+    local domain=""
+    local project_root=""
+    local php_version=""
+    local install_php="0"
+    local no_php="0"
+    local base_dir="${BASE_DIR}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain)
+                domain="${2:-}"
+                shift 2
+                ;;
+            --root)
+                project_root="${2:-}"
+                shift 2
+                ;;
+            --php)
+                php_version="${2:-}"
+                shift 2
+                ;;
+            --no-php)
+                no_php="1"
+                shift
+                ;;
+            --base-dir)
+                base_dir="${2:-}"
+                shift 2
+                ;;
+            --install-php)
+                install_php="1"
+                shift
+                ;;
+            *)
+                usage
+                fail "Unknown argument: $1"
+                ;;
+        esac
+    done
+
+    validate_domain "${domain}"
+    validate_base_dir "${base_dir}"
+    validate_project_root "${project_root}"
+
+    if [[ "${no_php}" == "1" ]]; then
+        [[ -z "${php_version}" ]] || fail "Use either --php or --no-php, not both."
+    else
+        [[ -n "${php_version}" ]] || fail "PHP version is required unless --no-php is used."
+        validate_php_version "${php_version}"
+        ensure_php_fpm "${php_version}" "${install_php}"
+    fi
+
+    local document_root="${BASE_DIR}/${project_root%/}"
+    local vhost_file="${NGINX_SITES_AVAILABLE}/${domain}"
+    local enabled_link="${NGINX_SITES_ENABLED}/${domain}"
+    local php_fpm_sock=""
+    local fallback="/index.php"
+    if [[ "${no_php}" != "1" ]]; then
+        php_fpm_sock="/run/php/php${php_version}-fpm.sock"
+    else
+        fallback="/index.html"
+    fi
+
+    echo "Domain: ${domain}"
+    echo "Document root: ${document_root}"
+    if [[ "${no_php}" == "1" ]]; then
+        echo "PHP-FPM: disabled"
+    else
+        echo "PHP-FPM: ${php_version}"
+    fi
+
+    mkdir -p "${document_root}"
+    chown -R "${CURRENT_USER}:${CURRENT_GROUP}" "${document_root}"
+    chmod -R 755 "${document_root}"
+
+    if [[ ! -f "${document_root}/index.php" && ! -f "${document_root}/index.html" ]]; then
+        if [[ "${no_php}" == "1" ]]; then
+            cat >"${document_root}/index.html" <<HTML
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>${domain}</title>
+</head>
+<body>
+    <h1>${domain}</h1>
+</body>
+</html>
+HTML
+            chown "${CURRENT_USER}:${CURRENT_GROUP}" "${document_root}/index.html"
+            chmod 644 "${document_root}/index.html"
+            echo "Created sample index.html"
+        else
+            cat >"${document_root}/index.php" <<'PHP'
+<?php
+phpinfo();
+PHP
+            chown "${CURRENT_USER}:${CURRENT_GROUP}" "${document_root}/index.php"
+            chmod 644 "${document_root}/index.php"
+            echo "Created sample index.php"
+        fi
+    else
+        echo "Existing index file kept"
+    fi
+
+    if ! grep -Eq "^[[:space:]]*${IP}[[:space:]]+.*(^|[[:space:]])${domain}([[:space:]]|$)" /etc/hosts; then
+        printf "%s %s\n" "${IP}" "${domain}" >> /etc/hosts
+        echo "Added /etc/hosts entry"
+    else
+        echo "/etc/hosts entry already exists"
+    fi
+
+    cat >"${vhost_file}" <<NGINX
+server {
+    listen 80;
+    server_name ${domain} www.${domain};
+    root ${document_root};
+    index index.html index.htm index.php;
+
+    location / {
+        try_files \$uri \$uri/ ${fallback};
+    }
+NGINX
+
+    if [[ "${no_php}" != "1" ]]; then
+        cat >>"${vhost_file}" <<NGINX
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:${php_fpm_sock};
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_buffer_size 128k;
+        fastcgi_buffers 4 256k;
+        fastcgi_busy_buffers_size 256k;
+    }
+NGINX
+    fi
+
+    cat >>"${vhost_file}" <<NGINX
+
+    location ~ /\.ht {
+        deny all;
+    }
+
+    error_log /var/log/nginx/${domain}_error.log;
+    access_log /var/log/nginx/${domain}_access.log;
+}
+NGINX
+
+    ln -sfn "${vhost_file}" "${enabled_link}"
+
+    nginx -t
+    systemctl reload nginx
+
+    echo "Ready: http://${domain}"
+}
+
+delete_site() {
+    local domain=""
+    local confirm=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain)
+                domain="${2:-}"
+                shift 2
+                ;;
+            --confirm)
+                confirm="${2:-}"
+                shift 2
+                ;;
+            *)
+                usage
+                fail "Unknown argument: $1"
+                ;;
+        esac
+    done
+
+    validate_domain "${domain}"
+    [[ "${confirm}" == "${domain}" ]] || fail "Confirmation does not match ${domain}."
+
+    local vhost_file="${NGINX_SITES_AVAILABLE}/${domain}"
+    local enabled_link="${NGINX_SITES_ENABLED}/${domain}"
+    local tmp_hosts
+    tmp_hosts="$(mktemp)"
+
+    echo "Removing vhost: ${domain}"
+
+    rm -f "${enabled_link}"
+    rm -f "${vhost_file}"
+
+    awk -v ip="${IP}" -v domain="${domain}" '
+        $1 != ip {
+            print
+            next
+        }
+        $1 == ip {
+            line = $1
+            kept = 0
+            for (i = 2; i <= NF; i++) {
+                if ($i != domain && $i != "www." domain) {
+                    line = line " " $i
+                    kept = 1
+                }
+            }
+            if (kept) print line
+        }
+    ' /etc/hosts > "${tmp_hosts}"
+    cat "${tmp_hosts}" > /etc/hosts
+    rm -f "${tmp_hosts}"
+
+    nginx -t
+    systemctl reload nginx
+
+    echo "Removed: ${domain}"
+    echo "Project files were kept."
+}
+
+require_root
+
+case "${1:-}" in
+    create)
+        shift
+        create_site "$@"
+        ;;
+    delete)
+        shift
+        delete_site "$@"
+        ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac

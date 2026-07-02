@@ -1,0 +1,8 @@
+.next/
+node_modules/
+tsconfig.tsbuildinfo
+
+# Each teammate/machine should keep local values here.
+config/app.env
+config/app.env.local
+config/sudoers.vhost-manager-next
