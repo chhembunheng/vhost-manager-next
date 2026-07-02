@@ -15,6 +15,22 @@ Open:
 http://localhost:3025
 ```
 
+Optional clean local URL:
+
+```sh
+sudo cp config/nginx.vhost-manager-shell /etc/nginx/sites-available/vhost-manager-shell
+sudo cp config/nginx.vhost-manager-shell /etc/nginx/sites-enabled/vhost-manager-shell
+echo "127.0.0.1 vhost-manager-shell" | sudo tee -a /etc/hosts
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Then open:
+
+```text
+http://vhost-manager-shell
+```
+
 ## Backend Agent
 
 For Vercel or any hosted frontend, each teammate runs the backend agent on their own machine:
