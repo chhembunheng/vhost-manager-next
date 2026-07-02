@@ -9,5 +9,16 @@ if [[ "${EUID}" -ne 0 ]]; then
     exit 1
 fi
 
-install -o root -g root -m 755 "${APP_DIR}/bin/vhost-manager-agent" "${TARGET}"
+cat > "${TARGET}" <<AGENT
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="\${VHOST_MANAGER_HOME:-${APP_DIR}}"
+cd "\${APP_DIR}"
+
+exec node agent/server.mjs "\$@"
+AGENT
+
+chown root:root "${TARGET}"
+chmod 755 "${TARGET}"
 echo "Installed ${TARGET}"
