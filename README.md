@@ -15,6 +15,33 @@ Open:
 http://localhost:3025
 ```
 
+## Backend Agent
+
+For Vercel or any hosted frontend, each teammate runs the backend agent on their own machine:
+
+```sh
+pnpm agent
+```
+
+Default agent URL:
+
+```text
+http://127.0.0.1:3036
+```
+
+The frontend can connect to it in two ways:
+
+- Click `Backend` in the UI and enter `http://127.0.0.1:3036`.
+- Or set `NEXT_PUBLIC_VHOST_API_URL=http://127.0.0.1:3036` before building/deploying the frontend.
+
+Optional token:
+
+```sh
+VHOST_AGENT_TOKEN=change-me pnpm agent
+```
+
+Then enter the same token in the UI Backend modal, or set `NEXT_PUBLIC_VHOST_API_TOKEN`.
+
 ## Teammate Setup
 
 Each teammate should keep their own local config:
@@ -43,6 +70,12 @@ Then run:
 ```sh
 pnpm install
 pnpm dev
+```
+
+For hosted UI + local backend:
+
+```sh
+pnpm agent
 ```
 
 Advanced: set `VHOST_MANAGER_CONFIG=/absolute/path/to/app.env.local` to load a config from another location.

@@ -6,6 +6,7 @@
     "dev": "next dev -H 0.0.0.0 -p 3025",
     "build": "next build",
     "start": "next start -H 0.0.0.0 -p 3025",
+    "agent": "node agent/server.mjs",
     "lint": "next lint"
   },
   "dependencies": {

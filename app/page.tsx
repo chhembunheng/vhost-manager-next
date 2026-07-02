@@ -143,6 +143,16 @@ const copy = {
     dark: 'Dark',
     english: 'English',
     khmer: 'Khmer',
+    backend: 'Backend',
+    backendApi: 'Backend API',
+    backendApiDesc: 'Use the bundled local API or connect this UI to a teammate machine running the local agent.',
+    backendUrl: 'Backend URL',
+    backendUrlPlaceholder: 'http://127.0.0.1:3036',
+    apiToken: 'API token',
+    apiTokenPlaceholder: 'optional',
+    saveBackend: 'Save backend',
+    bundledApi: 'Use bundled API',
+    runAgentHint: 'Run pnpm agent on the teammate machine.',
   },
   km: {
     realtime: 'ឧបករណ៍ Local បែប Real-time',
@@ -211,6 +221,16 @@ const copy = {
     dark: 'ងងឹត',
     english: 'អង់គ្លេស',
     khmer: 'ខ្មែរ',
+    backend: 'Backend',
+    backendApi: 'Backend API',
+    backendApiDesc: 'ប្រើ API ក្នុង app ឬភ្ជាប់ទៅ local agent របស់ម៉ាស៊ីន teammate។',
+    backendUrl: 'Backend URL',
+    backendUrlPlaceholder: 'http://127.0.0.1:3036',
+    apiToken: 'API token',
+    apiTokenPlaceholder: 'optional',
+    saveBackend: 'រក្សាទុក backend',
+    bundledApi: 'ប្រើ API ក្នុង app',
+    runAgentHint: 'Run pnpm agent នៅលើម៉ាស៊ីន teammate។',
   },
 } satisfies Record<Lang, Record<string, string>>;
 
@@ -227,6 +247,9 @@ const emptyState: VhostState = {
   rootSuggestions: [],
   rootError: '',
 };
+
+const configuredApiBase = process.env.NEXT_PUBLIC_VHOST_API_URL?.replace(/\/+$/, '') || '';
+const configuredApiToken = process.env.NEXT_PUBLIC_VHOST_API_TOKEN || '';
 
 export default function Home() {
   const [state, setState] = useState<VhostState>(emptyState);
@@ -249,10 +272,26 @@ export default function Home() {
   const [terminal, setTerminal] = useState(copy.en.ready);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget>(null);
   const [deleteConfirm, setDeleteConfirm] = useState('');
+  const [apiBase, setApiBase] = useState(configuredApiBase);
+  const [apiToken, setApiToken] = useState(configuredApiToken);
+  const [pendingApiBase, setPendingApiBase] = useState(configuredApiBase);
+  const [pendingApiToken, setPendingApiToken] = useState(configuredApiToken);
+  const [apiDialogOpen, setApiDialogOpen] = useState(false);
+
+  function apiUrl(path: string) {
+    return `${apiBase}${path}`;
+  }
+
+  function apiHeaders(extra?: HeadersInit): HeadersInit {
+    return {
+      ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
+      ...(extra || {}),
+    };
+  }
 
   async function refreshState(baseDir = selectedBaseDir) {
     const suffix = baseDir ? `?baseDir=${encodeURIComponent(baseDir)}` : '';
-    const response = await fetch(`/api/state${suffix}`, { cache: 'no-store' });
+    const response = await fetch(apiUrl(`/api/state${suffix}`), { cache: 'no-store', headers: apiHeaders() });
     const nextState = (await response.json()) as VhostState;
     setState(nextState);
     setSelectedBaseDir(nextState.config.baseDir);
@@ -265,6 +304,18 @@ export default function Home() {
     const savedRoot = window.localStorage.getItem('vhost-manager-project-root') || '';
     const savedLang = window.localStorage.getItem('vhost-manager-language') as Lang | null;
     const savedTheme = window.localStorage.getItem('vhost-manager-theme') as Theme | null;
+    const savedApiBase = window.localStorage.getItem('vhost-manager-api-base') || '';
+    const savedApiToken = window.localStorage.getItem('vhost-manager-api-token') || '';
+
+    if (!configuredApiBase && savedApiBase) {
+      setApiBase(savedApiBase.replace(/\/+$/, ''));
+      setPendingApiBase(savedApiBase.replace(/\/+$/, ''));
+    }
+
+    if (!configuredApiToken && savedApiToken) {
+      setApiToken(savedApiToken);
+      setPendingApiToken(savedApiToken);
+    }
 
     if (savedLang === 'en' || savedLang === 'km') {
       setLang(savedLang);
@@ -279,12 +330,35 @@ export default function Home() {
       setRootDialogOpen(true);
     }
 
-    refreshState(savedRoot).catch((error) => {
-      setTerminalStatus('bad');
-      setTerminalTitle(copy.en.loadFailed);
-      setTerminal(error.message);
-      setLoading(false);
-    });
+    if (!configuredApiBase && !savedApiBase && !['localhost', '127.0.0.1'].includes(window.location.hostname)) {
+      setApiDialogOpen(true);
+    }
+
+    const initialApiBase = configuredApiBase || savedApiBase.replace(/\/+$/, '');
+    const suffix = savedRoot ? `?baseDir=${encodeURIComponent(savedRoot)}` : '';
+    fetch(`${initialApiBase}/api/state${suffix}`, {
+      cache: 'no-store',
+      headers: {
+        ...((configuredApiToken || savedApiToken) ? { Authorization: `Bearer ${configuredApiToken || savedApiToken}` } : {}),
+      },
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await response.text());
+        return response.json() as Promise<VhostState>;
+      })
+      .then((nextState) => {
+        setState(nextState);
+        setSelectedBaseDir(nextState.config.baseDir);
+        setPendingBaseDir(nextState.config.baseDir);
+        setPhp((current) => current || nextState.phpOptions.find((item) => item.installed)?.version || nextState.phpOptions[0]?.version || '');
+        setLoading(false);
+      })
+      .catch((error) => {
+        setTerminalStatus('bad');
+        setTerminalTitle(copy.en.loadFailed);
+        setTerminal(error.message);
+        setLoading(false);
+      });
   }, []);
 
   useEffect(() => {
@@ -316,6 +390,49 @@ export default function Home() {
     await refreshState(trimmed);
   }
 
+  async function applyBackend() {
+    const nextBase = pendingApiBase.trim().replace(/\/+$/, '');
+    const nextToken = pendingApiToken.trim();
+    window.localStorage.setItem('vhost-manager-api-base', nextBase);
+    window.localStorage.setItem('vhost-manager-api-token', nextToken);
+    setApiBase(nextBase);
+    setApiToken(nextToken);
+    setApiDialogOpen(false);
+    setLoading(true);
+
+    const savedRoot = window.localStorage.getItem('vhost-manager-project-root') || '';
+    const suffix = savedRoot ? `?baseDir=${encodeURIComponent(savedRoot)}` : '';
+    const response = await fetch(`${nextBase}/api/state${suffix}`, {
+      cache: 'no-store',
+      headers: nextToken ? { Authorization: `Bearer ${nextToken}` } : {},
+    });
+    const nextState = (await response.json()) as VhostState;
+    setState(nextState);
+    setSelectedBaseDir(nextState.config.baseDir);
+    setPendingBaseDir(nextState.config.baseDir);
+    setLoading(false);
+  }
+
+  async function useBundledApi() {
+    window.localStorage.removeItem('vhost-manager-api-base');
+    window.localStorage.removeItem('vhost-manager-api-token');
+    setPendingApiBase('');
+    setPendingApiToken('');
+    setApiBase('');
+    setApiToken('');
+    setApiDialogOpen(false);
+    setLoading(true);
+
+    const savedRoot = window.localStorage.getItem('vhost-manager-project-root') || '';
+    const suffix = savedRoot ? `?baseDir=${encodeURIComponent(savedRoot)}` : '';
+    const response = await fetch(`/api/state${suffix}`, { cache: 'no-store' });
+    const nextState = (await response.json()) as VhostState;
+    setState(nextState);
+    setSelectedBaseDir(nextState.config.baseDir);
+    setPendingBaseDir(nextState.config.baseDir);
+    setLoading(false);
+  }
+
   const filteredSites = useMemo(() => {
     const needle = query.trim().toLowerCase();
     if (!needle) return state.sites;
@@ -339,9 +456,9 @@ export default function Home() {
     setTerminal('');
 
     try {
-      const response = await fetch('/api/stream', {
+      const response = await fetch(apiUrl('/api/stream'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: apiHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(payload),
       });
 
@@ -446,6 +563,10 @@ export default function Home() {
             >
               {theme === 'light' ? <Moon size={14} /> : <Sun size={14} />}
               {theme === 'light' ? t.dark : t.light}
+            </Button>
+            <Button variant="secondary" size="sm" type="button" onClick={() => setApiDialogOpen(true)}>
+              <Server size={14} />
+              {t.backend}
             </Button>
             <Badge variant="outline">
               <Folder size={14} />
@@ -735,6 +856,58 @@ export default function Home() {
                   {t.cancel}
                 </Button>
               )}
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={apiDialogOpen} onMouseDown={(event) => event.target === event.currentTarget && setApiDialogOpen(false)}>
+        <DialogContent className="rootDialog" aria-labelledby="backend-title">
+          <DialogHeader>
+            <DialogTitle id="backend-title">
+              <Server size={18} />
+              {t.backendApi}
+            </DialogTitle>
+            <DialogDescription>{t.backendApiDesc}</DialogDescription>
+          </DialogHeader>
+
+          <form
+            className="stack"
+            onSubmit={(event) => {
+              event.preventDefault();
+              applyBackend().catch((error) => {
+                setTerminalStatus('bad');
+                setTerminalTitle(copy.en.failed);
+                setTerminal(error.message);
+                setLoading(false);
+              });
+            }}
+          >
+            <Field>
+              <FieldLabel>{t.backendUrl}</FieldLabel>
+              <Input
+                value={pendingApiBase}
+                onChange={(event) => setPendingApiBase(event.target.value)}
+                placeholder={t.backendUrlPlaceholder}
+              />
+            </Field>
+            <Field>
+              <FieldLabel>{t.apiToken}</FieldLabel>
+              <Input
+                value={pendingApiToken}
+                onChange={(event) => setPendingApiToken(event.target.value)}
+                placeholder={t.apiTokenPlaceholder}
+              />
+            </Field>
+            <p className="muted">{t.runAgentHint}</p>
+            <div className="buttonRow">
+              <Button type="submit" disabled={!pendingApiBase.trim()}>
+                <CheckCircle2 size={16} />
+                {t.saveBackend}
+              </Button>
+              <Button variant="secondary" type="button" onClick={() => useBundledApi()}>
+                {t.bundledApi}
+              </Button>
             </div>
           </form>
         </DialogContent>
