@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TARGET="/usr/local/bin/vhost-manager-agent"
+
+if [[ "${EUID}" -ne 0 ]]; then
+    echo "Run with sudo: sudo ${APP_DIR}/bin/install-agent-command" >&2
+    exit 1
+fi
+
+install -o root -g root -m 755 "${APP_DIR}/bin/vhost-manager-agent" "${TARGET}"
+echo "Installed ${TARGET}"

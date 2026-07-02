@@ -36,7 +36,21 @@ http://vhost-manager-shell
 For Vercel or any hosted frontend, each teammate runs the backend agent on their own machine:
 
 ```sh
+cd /path/to/vhost-manager-next
 pnpm agent
+```
+
+From any directory, use pnpm's `--dir` option:
+
+```sh
+pnpm --dir /path/to/vhost-manager-next agent
+```
+
+Or install the global wrapper once:
+
+```sh
+sudo ./bin/install-agent-command
+vhost-manager-agent
 ```
 
 Default agent URL:
@@ -91,6 +105,7 @@ pnpm dev
 For hosted UI + local backend:
 
 ```sh
+cd /path/to/vhost-manager-next
 pnpm agent
 ```
 
